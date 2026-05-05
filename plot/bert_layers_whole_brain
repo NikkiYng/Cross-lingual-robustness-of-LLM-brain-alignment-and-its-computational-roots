@@ -1,0 +1,125 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+import re
+from subcortex_visualization.plotting import plot_subcortical_data
+from brainspace.plotting.surface_plotting import plot_hemispheres
+from brainspace.utils.parcellation import map_to_labels
+from brainstat.datasets import fetch_parcellation, fetch_template_surface, fetch_mask
+import warnings
+warnings.filterwarnings("ignore")
+
+# 1. Set path
+base_dir = '/Users/niyang/Downloads/script/visual/new_results/416/'
+data_dir = os.path.join(base_dir, 'en_bert')
+output_dir = os.path.join(base_dir, 'en_bert_plot') 
+os.makedirs(output_dir, exist_ok=True)
+os.chdir(base_dir)
+print('Working directory:', os.getcwd())
+
+# 2. Find and sort layerwise significant scores
+files = [f for f in os.listdir(data_dir) if 'thred_rs' in f and f.endswith('.npy')]
+files_with_layer = []
+for f in files:
+    match = re.search(r'layer_(\d+)', f)
+    if match:
+        layer_num = int(match.group(1))
+        files_with_layer.append((layer_num, f))
+files_with_layer.sort(key=lambda x: x[0])  # sort by layer number
+
+
+# 3. Load surface and parcellation 
+labeling = fetch_parcellation("fsaverage5", "schaefer", n_regions=400, join=True, seven_networks=True)
+surf_lh, surf_rh = fetch_template_surface("fsaverage5", join=False)
+mask = fetch_mask("fsaverage5")
+
+# 4. Set up label lists for subcortex
+structure_labels = [
+    'accumbens', 'amygdala', 'caudate', 'hippocampus',
+    'pallidum', 'putamen', 'thalamus_anterior', 'thalamus_posterior'
+]
+roi_labels = structure_labels * 2  # 8 regions x 2 hemispheres
+hemispheres = ['L'] * 8 + ['R'] * 8
+
+# 5. Loop through files and generate plots
+cortical_images = []
+subcortical_images = []
+
+for layer_num, filename in files_with_layer:
+    print(f"Processing {filename}...")
+    file_path = os.path.join(data_dir, filename)
+    layer_id = str(layer_num)
+
+    # Load data
+    data = np.load(file_path)
+    subc_values = data[:16]
+    cort_values = data[16:]
+
+    # Prepare subcortical DataFrame
+    subc_df = pd.DataFrame({
+        'region': roi_labels,
+        'Hemisphere': hemispheres,
+        'value': subc_values[:16]
+    })
+
+    # Plot subcortical
+    fig = plot_subcortical_data(
+        subcortex_data=subc_df,
+        atlas='Melbourne_S1',
+        hemisphere='both',
+        fill_title=f'Layer {layer_id}',
+        cmap='viridis_r',
+        show_legend=False,
+        show_figure=False
+    )
+    subc_filename = f"subcortex_layer_{layer_id}.png"
+    subc_filepath = os.path.join(output_dir, subc_filename)
+    fig.savefig(subc_filepath, dpi=600, bbox_inches='tight')
+    plt.close(fig)
+    subc_img = Image.open(subc_filepath)
+    subcortical_images.append(subc_img)
+
+    # Plot cortical
+    cort_mapped = map_to_labels(cort_values, labeling, mask=mask, fill=np.nan)
+    plotter = plot_hemispheres(
+        surf_lh, surf_rh, array_name=cort_mapped, size=(2400, 500),
+        cmap='viridis_r', color_bar=True,
+        label_text=[f"Layer {layer_id}"],
+        nan_color=(0.7, 0.7, 0.7, 1),
+        zoom=1.2, embed_nb=True, interactive=False, return_plotter=True
+    )
+    img = Image.fromarray(plotter.to_numpy())
+    cort_filename = f"cortex_layer_{layer_id}.png"
+    cort_filepath = os.path.join(output_dir, cort_filename)
+    img.save(cort_filepath, dpi=(600, 600))
+    cortical_images.append(img)
+
+
+# 6. Stack cortical images vertically and save
+if cortical_images:
+    total_height = sum(img.height for img in cortical_images)
+    max_width = max(img.width for img in cortical_images)
+    stacked_img = Image.new('RGB', (max_width, total_height))
+    y_offset = 0
+    for img in cortical_images:
+        stacked_img.paste(img, (0, y_offset))
+        y_offset += img.height
+    stacked_path = os.path.join(output_dir, 'en_bert_cortex_stacked.png')
+    stacked_img.save(stacked_path, dpi=(600, 600))
+    print(f"Saved cortical stacked image to: {stacked_path}")
+
+
+# 7. Stack subcortical images vertically and save
+if subcortical_images:
+    total_height = sum(img.height for img in subcortical_images)
+    max_width = max(img.width for img in subcortical_images)
+    stacked_img = Image.new('RGB', (max_width, total_height))
+    y_offset = 0
+    for img in subcortical_images:
+        stacked_img.paste(img, (0, y_offset))
+        y_offset += img.height
+    stacked_path = os.path.join(output_dir, 'en_bert_subcortex_stacked.png')
+    stacked_img.save(stacked_path, dpi=(600, 600))
+    print(f"Saved subcortical stacked image to: {stacked_path}")
