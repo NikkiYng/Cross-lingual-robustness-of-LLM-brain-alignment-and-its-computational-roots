@@ -1,0 +1,131 @@
+import os
+import re
+import numpy as np
+from PIL import Image
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+from brainspace.plotting.surface_plotting import plot_hemispheres
+from brainspace.utils.parcellation import map_to_labels
+from brainstat.datasets import fetch_parcellation, fetch_template_surface, fetch_mask
+import matplotlib.pyplot as plt
+
+# === 1. Paths ===
+base_dir = "/Users/niyang/Downloads/script/visual/new_results/416/"
+cn_dir = os.path.join(base_dir, "cn_mbert")
+fr_dir = os.path.join(base_dir, "fr_mbert")
+en_dir = os.path.join(base_dir, "en_mbert")
+output_dir = os.path.join(base_dir, "mbert_comparison_plots_new")
+os.makedirs(output_dir, exist_ok=True)
+
+# === 2. Find and match files ===
+def get_sorted_files(folder):
+    files = [f for f in os.listdir(folder) if 'thred_rs' in f and f.endswith('.npy')]
+    matched = []
+    for f in files:
+        match = re.search(r'layer_(\d+)', f)
+        if match:
+            layer_num = int(match.group(1))
+            matched.append((layer_num, f))
+    return sorted(matched)
+
+cn_files = get_sorted_files(cn_dir)
+fr_files = get_sorted_files(fr_dir)
+en_files = get_sorted_files(en_dir)
+
+# Align common layers
+layer_nums = sorted(set([x[0] for x in cn_files]) & set([x[0] for x in fr_files]) & set([x[0] for x in en_files]))
+
+# === 3. Load surface and parcellation ===
+
+labeling = fetch_parcellation("fsaverage5", "schaefer", n_regions=400, join=True)
+surf_lh, surf_rh = fetch_template_surface("fsaverage5", join=False)
+mask = fetch_mask("fsaverage5")
+BG_HEX = "#F0F0F0"
+cmap = ListedColormap([
+    "#bbd83c",  # 1 Only CN
+    "#006871",  # 2 Only FR
+    "#0097b2",  # 3 Only EN
+    "#c2f6ff"   # 4 All
+])
+stacked_images = []
+
+# === 5. Loop through layers ===
+for layer in layer_nums:
+    cn_file = [f for l, f in cn_files if l == layer][0]
+    fr_file = [f for l, f in fr_files if l == layer][0]
+    en_file = [f for l, f in en_files if l == layer][0]
+
+    data_cn = np.load(os.path.join(cn_dir, cn_file))
+    data_fr = np.load(os.path.join(fr_dir, fr_file))
+    data_en = np.load(os.path.join(en_dir, en_file))
+
+    cort_cn = data_cn[16:]
+    cort_fr = data_fr[16:]
+    cort_en = data_en[16:]
+
+    mask_cn = ~np.isnan(cort_cn)
+    mask_fr = ~np.isnan(cort_fr)
+    mask_en = ~np.isnan(cort_en)
+
+    only_cn = mask_cn & ~mask_fr & ~mask_en
+    only_fr = mask_fr & ~mask_cn & ~mask_en
+    only_en = mask_en & ~mask_cn & ~mask_fr
+    all_three = mask_cn & mask_fr & mask_en
+
+    combined_map = np.full_like(cort_cn, np.nan)
+    combined_map[only_cn] = 1
+    combined_map[only_fr] = 2
+    combined_map[only_en] = 3
+    combined_map[all_three] = 4
+
+    cortical_values = map_to_labels(combined_map, labeling, mask=mask, fill=np.nan)
+
+    plotter = plot_hemispheres(
+        surf_lh, surf_rh,
+        array_name=cortical_values,
+        size=(2400, 500),
+        embed_nb=False,
+        cmap=cmap,
+        color_bar=False,
+        nan_color=(0.7, 0.7, 0.7, 1),
+        zoom=1.2,
+        interactive=False,
+        return_plotter=True,
+        label_text=[f"Layer {layer}"]
+    )
+
+    img = Image.fromarray(plotter.to_numpy())
+    output_img_path = os.path.join(output_dir, f"comparison_cn_fr_en_layer_{layer}.png")
+    img.save(output_img_path, dpi=(600, 600))
+    stacked_images.append(img)
+
+# === 6. Stack all layer plots ===
+if stacked_images:
+    total_height = sum(img.height for img in stacked_images)
+    max_width = max(img.width for img in stacked_images)
+    final_img = Image.new("RGB", (max_width, total_height), color="white")
+    y_offset = 0
+    for img in stacked_images:
+        final_img.paste(img, (0, y_offset))
+        y_offset += img.height
+
+    final_output = os.path.join(output_dir, "mBERT_cn_fr_en_cort_stacked.png")
+    final_img.save(final_output, dpi=(600, 600))
+    print(f"Stacked comparison saved to: {final_output}")
+
+# === 7. Legend ===
+legend_elements = [
+    Patch(facecolor="#bbd83c", edgecolor='none', label='Only Chinese'),
+    Patch(facecolor="#006871", edgecolor='none', label='Only French'),
+    Patch(facecolor="#0097b2", edgecolor='none', label='Only English'),
+    Patch(facecolor="#c2f6ff", edgecolor='none', label='Common to All')
+]
+fig, ax = plt.subplots(figsize=(7, 1.8))
+ax.axis('off')
+legend = ax.legend(handles=legend_elements, loc='center', ncol=4, frameon=False, fontsize=14)
+plt.tight_layout()
+
+legend_path = os.path.join(output_dir, "comparison_legend_cn_fr_en.png")
+fig.savefig(legend_path, dpi=600, bbox_inches='tight')
+plt.close(fig)
+print("Legend saved to:", legend_path)
