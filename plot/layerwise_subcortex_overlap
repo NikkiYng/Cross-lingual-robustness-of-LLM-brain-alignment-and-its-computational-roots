@@ -1,0 +1,181 @@
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
+
+from subcortex_visualization.plotting import plot_subcortical_data
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# 1) Paths & setup
+base_dir = "/Users/niyang/Downloads/script/visual/new_results/416/"
+cn_dir = os.path.join(base_dir, "cn_mbert")
+fr_dir = os.path.join(base_dir, "fr_mbert")
+en_dir = os.path.join(base_dir, "en_mbert")
+
+output_dir = os.path.join(base_dir, "mbert_comparison_plots_subcortex_new")
+os.makedirs(output_dir, exist_ok=True)
+FILENAME_KEYWORD = "thred_rs" 
+
+
+# 2) Helpers to find & align files
+def find_layer_num(fname):
+    """Extract layer number from either 'layer_XX' or 'tran_XX' patterns."""
+    m = re.search(r'layer_(\d+)', fname)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'tran_(\d+)', fname)
+    if m:
+        return int(m.group(1))
+    return None
+
+def get_sorted_files(folder, keyword):
+    files = [f for f in os.listdir(folder) if keyword in f and f.endswith(".npy")]
+    pairs = []
+    for f in files:
+        ln = find_layer_num(f)
+        if ln is not None:
+            pairs.append((ln, f))
+    return sorted(pairs, key=lambda x: x[0])
+
+cn_files = get_sorted_files(cn_dir, FILENAME_KEYWORD)
+fr_files = get_sorted_files(fr_dir, FILENAME_KEYWORD)
+en_files = get_sorted_files(en_dir, FILENAME_KEYWORD)
+
+# Intersect layers across languages
+cn_layers = {l for l, _ in cn_files}
+fr_layers = {l for l, _ in fr_files}
+en_layers = {l for l, _ in en_files}
+layer_nums = sorted(cn_layers & fr_layers & en_layers)
+
+if not layer_nums:
+    raise RuntimeError("No common layers found across CN/FR/EN with the given FILENAME_KEYWORD.")
+
+# Quick dicts for lookup: layer -> filename
+cn_map = {l:f for l, f in cn_files}
+fr_map = {l:f for l, f in fr_files}
+en_map = {l:f for l, f in en_files}
+
+
+# 3) Subcortical labeling
+structure_labels = [
+    "accumbens", "amygdala", "caudate", "hippocampus",
+    "pallidum", "putamen", "thalamus_anterior", "thalamus_posterior"
+]
+roi_labels = structure_labels * 2
+hemispheres = ["L"] * 8 + ["R"] * 8
+n_subc = 16  # first 16 values in your arrays are subcortical
+
+
+# 4) Colormap & legend for categories
+cmap = ListedColormap([
+    "#bbd83c",  # 1 Only CN
+    "#006871",  # 2 Only FR
+    "#0097b2",  # 3 Only EN
+    "#c2f6ff"   # 4 All
+])
+
+# Boundaries so each integer 1..4 maps cleanly to a color
+bounds = [0.5, 1.5, 2.5, 3.5, 4.5]
+norm = BoundaryNorm(bounds, cmap.N, clip=False)
+
+legend_elements = [
+    Patch(facecolor="#bbd83c", edgecolor='none', label='Only Chinese'),
+    Patch(facecolor="#006871", edgecolor='none', label='Only French'),
+    Patch(facecolor="#0097b2", edgecolor='none', label='Only English'),
+    Patch(facecolor="#c2f6ff", edgecolor='none', label='Common to All')
+]
+
+
+# 5) Generate per-layer subcortical overlap plots
+layer_images = []
+
+for layer in layer_nums:
+    print(f"Processing subcortical overlaps for layer {layer}...")
+    cn_file = os.path.join(cn_dir, cn_map[layer])
+    fr_file = os.path.join(fr_dir, fr_map[layer])
+    en_file = os.path.join(en_dir, en_map[layer])
+
+    data_cn = np.load(cn_file)
+    data_fr = np.load(fr_file)
+    data_en = np.load(en_file)
+
+    # Take first 16 values as subcortex
+    subc_cn = data_cn[:n_subc]
+    subc_fr = data_fr[:n_subc]
+    subc_en = data_en[:n_subc]
+
+    # Presence masks (non-NaN = present/significant)
+    mask_cn = ~np.isnan(subc_cn)
+    mask_fr = ~np.isnan(subc_fr)
+    mask_en = ~np.isnan(subc_en)
+
+    only_cn = mask_cn & ~mask_fr & ~mask_en
+    only_fr = mask_fr & ~mask_cn & ~mask_en
+    only_en = mask_en & ~mask_cn & ~mask_fr
+    all_three = mask_cn & mask_fr & mask_en
+
+    # Build category codes per subcortical ROI
+    combined = np.full(n_subc, np.nan)
+    combined[only_cn]   = 1
+    combined[only_fr]   = 2
+    combined[only_en]   = 3
+    combined[all_three] = 4
+
+    # Make a dataframe for the plotting function
+    subc_df = pd.DataFrame({
+        "region": roi_labels,
+        "Hemisphere": hemispheres,
+        "value": combined
+    })
+
+    # Plot with discrete colormap; hide legend (we'll export a separate legend)
+    fig = plot_subcortical_data(
+        subcortex_data=subc_df,
+        atlas="Melbourne_S1",
+        hemisphere="both",
+        fill_title=f"Layer {layer}",
+        cmap=cmap,
+        vmin=1, vmax=4,      # ensures the discrete mapping 1..4
+        show_legend=False,
+        show_figure=False
+    )
+
+    # Save per-layer figure
+    out_path = os.path.join(output_dir, f"subc_overlap_cn_fr_en_layer_{layer}.png")
+    fig.savefig(out_path, dpi=600, bbox_inches="tight")
+    plt.close(fig)
+
+    layer_images.append(Image.open(out_path))
+
+
+# 6) Stack all layers vertically
+if layer_images:
+    total_h = sum(im.height for im in layer_images)
+    max_w = max(im.width for im in layer_images)
+    stacked = Image.new("RGB", (max_w, total_h), color="white")
+    y = 0
+    for im in layer_images:
+        stacked.paste(im, (0, y))
+        y += im.height
+
+    final_path = os.path.join(output_dir, "mBERT_cn_fr_en_subc_overlap_stacked.png")
+    stacked.save(final_path, dpi=(600, 600))
+    print(f"Stacked subcortical overlap saved to: {final_path}")
+
+
+# 7) Export legend image
+fig, ax = plt.subplots(figsize=(7, 1.8))
+ax.axis("off")
+ax.legend(handles=legend_elements, loc="center", ncol=4, frameon=False, fontsize=14)
+plt.tight_layout()
+legend_path = os.path.join(output_dir, "subc_overlap_legend_cn_fr_en.png")
+fig.savefig(legend_path, dpi=300, bbox_inches="tight")
+plt.close(fig)
+print("Legend saved to:", legend_path)
