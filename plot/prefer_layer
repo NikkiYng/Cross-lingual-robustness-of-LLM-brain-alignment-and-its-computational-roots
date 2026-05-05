@@ -1,0 +1,142 @@
+import os, re
+import numpy as np
+from brainspace.utils.parcellation import map_to_labels
+from brainspace.plotting.surface_plotting import plot_hemispheres
+from brainstat.datasets import fetch_mask, fetch_template_surface, fetch_parcellation
+from PIL import Image
+
+# === 1. Paths ===
+base_dir = "/Users/niyang/Downloads/script/visual/new_results/416/"
+cn_dir = os.path.join(base_dir, "cn_mbert", "group_cv")
+fr_dir = os.path.join(base_dir, "fr_mbert", "group_cv")
+en_dir = os.path.join(base_dir, "en_mbert", "group_cv")
+
+# === 2. Helpers ===
+def get_sorted_files(folder):
+    files = [f for f in os.listdir(folder) if "group_cv" in f and f.endswith(".npy")]
+    layers = []
+    for f in files:
+        m = re.search(r"layer_(\d+)", f)
+        if m:
+            layers.append((int(m.group(1)), f))
+    return sorted(layers)  # list of (layer_num, filename)
+
+
+N_SUBCORTICAL = 16  # Tian subcortex
+
+def load_layer_cortex_mean(folder, files, layer, reduce="mean"):
+    fname = next(f for l, f in files if l == layer)
+    x = np.load(os.path.join(folder, fname)).astype(float)
+    x = np.squeeze(x)
+
+    if x.ndim == 2:
+        x = np.nanmean(x, axis=0)
+
+    if x.ndim != 1:
+        raise ValueError(f"Unexpected shape {x.shape} in {fname}")
+
+    # drop subcortical ROIs 
+    return x[N_SUBCORTICAL:]   # (400,)
+
+def load_all_layers(folder, files, layer_nums, reduce="mean"):
+    mats = []
+    for l in layer_nums:
+        roi_vec = load_layer_cortex_mean(folder, files, l, reduce=reduce)
+        mats.append(roi_vec)
+    return np.vstack(mats)  # (n_layers, n_rois)
+
+def preferred_layer_and_value(layer_by_roi, layer_nums):
+    """
+    layer_by_roi: (n_layers, n_rois)
+    layer_nums: actual layer ids corresponding to rows in layer_by_roi
+    returns:
+      pref_layer: (n_rois,) float, layer number (not row index)
+      max_val:    (n_rois,) float
+    """
+    arg = np.argmax(layer_by_roi, axis=0)           # row index
+    pref_layer = np.array([layer_nums[i] for i in arg], dtype=float)
+    max_val = np.max(layer_by_roi, axis=0)
+    return pref_layer, max_val
+
+# === 3. Collect shared layer numbers ===
+
+cn_files = get_sorted_files(cn_dir)
+fr_files = get_sorted_files(fr_dir)
+en_files = get_sorted_files(en_dir)
+
+layer_nums = sorted(
+    set([l for l, _ in cn_files]) &
+    set([l for l, _ in fr_files]) &
+    set([l for l, _ in en_files])
+)
+if len(layer_nums) == 0:
+    raise ValueError("No shared layers found across CN/FR/EN folders.")
+
+
+# === 4. Load all layers per language ===
+
+cn_mat = load_all_layers(cn_dir, cn_files, layer_nums, reduce="mean")
+fr_mat = load_all_layers(fr_dir, fr_files, layer_nums, reduce="mean")
+en_mat = load_all_layers(en_dir, en_files, layer_nums, reduce="mean")
+n_layers, n_rois = cn_mat.shape
+
+# === 5. Preferred layer per ROI + max value per ROI ===
+cn_pref, cn_max = preferred_layer_and_value(cn_mat, layer_nums)
+fr_pref, fr_max = preferred_layer_and_value(fr_mat, layer_nums)
+en_pref, en_max = preferred_layer_and_value(en_mat, layer_nums)
+
+
+USE_PERCENTILE_MASK = False
+if USE_PERCENTILE_MASK:
+    # per-language percentile thresholds
+    p = 60  # keep ROIs above the 60th percentile of max scores
+    thr_cn = np.percentile(cn_max, p)
+    thr_fr = np.percentile(fr_max, p)
+    thr_en = np.percentile(en_max, p)
+
+    cn_pref = np.where(cn_max >= thr_cn, cn_pref, np.nan)
+    fr_pref = np.where(fr_max >= thr_fr, fr_pref, np.nan)
+    en_pref = np.where(en_max >= thr_en, en_pref, np.nan)
+else:
+    # absolute threshold example
+    thr = 0.0
+    cn_pref = np.where(cn_max > thr, cn_pref, np.nan)
+    fr_pref = np.where(fr_max > thr, fr_pref, np.nan)
+    en_pref = np.where(en_max > thr, en_pref, np.nan)
+
+
+# === 6. Map ROI vectors to surface and plot ===
+yeo_net = 7
+surf_lh, surf_rh = fetch_template_surface("fsaverage5", join=False)
+labeling = fetch_parcellation(
+    "fsaverage5", "schaefer",
+    n_regions=n_rois, join=True,
+    seven_networks=(yeo_net == 7)
+)
+mask = fetch_mask("fsaverage5")
+
+cn_mapped = map_to_labels(cn_pref, labeling, mask=mask, fill=np.nan)
+fr_mapped = map_to_labels(fr_pref, labeling, mask=mask, fill=np.nan)
+en_mapped = map_to_labels(en_pref, labeling, mask=mask, fill=np.nan)
+
+
+# === 7. Plot CN/FR/EN preferred-layer maps ===
+tog_mapped = np.array([cn_mapped, fr_mapped, en_mapped])
+
+plotter = plot_hemispheres(
+    surf_lh, surf_rh,
+    array_name=tog_mapped,
+    size=(2800, 3600),
+    cmap="inferno_r",          
+    color_bar=True,
+    layout_style="grid",
+    label_text=["CN", "FR", "EN"],
+    nan_color=(0.7, 0.7, 0.7, 1),
+    zoom=1.6,
+    embed_nb=True,
+    return_plotter=True
+)
+
+out_png = "/Users/niyang/Downloads/3lan_preferred_layer.png"
+Image.fromarray(plotter.to_numpy()).save(out_png, dpi=(600, 600))
+print("Saved:", out_png)
