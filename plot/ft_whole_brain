@@ -1,0 +1,69 @@
+# 1. Packages
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from PIL import Image
+
+from subcortex_visualization.plotting import plot_subcortical_data
+from brainspace.plotting.surface_plotting import plot_hemispheres
+from brainspace.utils.parcellation import map_to_labels
+from brainstat.datasets import fetch_parcellation, fetch_template_surface, fetch_mask
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# 2. Load data
+data = np.load("/Users/niyang/Downloads/thred_rs_ft_isol.npy") 
+assert data.shape == (416,), "Expected a flat array with 416 ROI values."
+
+# Separate subcortical and cortical values
+subc_values = data[:16]  
+cort_values = data[16:]   
+
+# 3. Prepare subcortex
+structure_labels = [
+    'accumbens', 'amygdala', 'caudate', 'hippocampus',
+    'pallidum', 'putamen', 'thalamus_anterior', 'thalamus_posterior'
+]
+roi_labels = structure_labels * 2  # 8 regions * 2 hemispheres = 16 ROIs
+hemispheres = ['L'] * 8 + ['R'] * 8
+
+subc_df = pd.DataFrame({
+    'region': roi_labels,
+    'Hemisphere': hemispheres,
+    'value': subc_values[:16]  # Use only the 16 mapped regions
+})
+
+# 4. Plot subcortical
+fig = plot_subcortical_data(
+    subcortex_data=subc_df,
+    atlas='Melbourne_S1',
+    hemisphere='both',
+    fill_title='',
+    cmap='viridis_r',
+    show_legend=True,
+    show_figure=False
+)
+
+fig.savefig("/Users/niyang/Downloads/script/visual/new_results/ft_sub.png", dpi=600, bbox_inches='tight')
+plt.close(fig)
+
+# 5. Plot cortex
+labeling = fetch_parcellation("fsaverage5", "schaefer", n_regions=400, join=True, seven_networks=True)
+surf_lh, surf_rh = fetch_template_surface("fsaverage5", join=False)
+mask = fetch_mask("fsaverage5")
+
+cort_mapped = map_to_labels(cort_values, labeling, mask=mask, fill=np.nan)
+
+plotter = plot_hemispheres(
+    surf_lh, surf_rh, array_name=cort_mapped, size=(2400, 500),
+    cmap='viridis_r', color_bar=True,
+    label_text=["Brain score"], nan_color=(0.7, 0.7, 0.7, 1),
+    zoom=1.2, embed_nb=True, interactive=False, return_plotter=True
+)
+
+img = Image.fromarray(plotter.to_numpy())
+img.save("/Users/niyang/Downloads/script/visual/new_results/ft_cortex_plot.png", dpi=(600, 600))
