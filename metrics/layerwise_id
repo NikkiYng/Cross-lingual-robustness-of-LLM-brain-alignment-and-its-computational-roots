@@ -1,0 +1,312 @@
+# 1. Load library
+import io
+import os
+import random
+import contextlib
+import warnings
+import re
+import numpy as np
+import pandas as pd
+import torch
+from transformers import AutoTokenizer, AutoModel
+import matplotlib.pyplot as plt
+
+from dadapy import data as dp
+from sklearn.preprocessing import normalize, StandardScaler
+
+warnings.filterwarnings('ignore')
+
+# 2. Setups
+NPZ_PATHS = {
+    "CN": "/gpfs/home/nyang/embs/mbert_embs_cn_new.npz",
+    "EN": "/gpfs/home/nyang/embs/mbert_embs_en.npz",
+    "FR": "/gpfs/home/nyang/embs/mbert_embs_fr.npz",
+}
+
+MAX_TOK_PER_LANG = 8000
+SEED = 42
+DISTANCE_MODE = "cosine"   # "cosine" or "euclid"
+
+
+# 3. Helpers
+def load_layer_embs_from_npz(npz_path, max_tokens=None, seed=SEED):
+    """
+    Load layer-wise embeddings from .npz with keys: BERT_layer_{i}isol
+    Returns:
+        layer_ids: list of layer indices
+        layer_embs: dict[layer_idx] -> np.ndarray [N_tokens, H]
+    """
+    print(f"\nLoading embeddings from: {npz_path}")
+    data = np.load(npz_path)
+
+    layer_pattern = re.compile(r"BERT_layer_(\d+)isol")
+    layers = []
+
+    for key in data.files:
+        m = layer_pattern.match(key)
+        if m:
+            layers.append((int(m.group(1)), key))
+
+    layers = sorted(layers, key=lambda x: x[0])
+    layer_ids = [ell for ell, _ in layers]
+
+    layer_embs = {}
+    for ell, key in layers:
+        X = data[key]  # shape [N_tokens, H]
+        print(f"  Layer {ell}: {X.shape}")
+
+        # optional subsampling
+        if max_tokens is not None and X.shape[0] > max_tokens:
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(X.shape[0], size=max_tokens, replace=False)
+            X = X[idx]
+
+        layer_embs[ell] = X
+
+    return layer_ids, layer_embs
+
+def _preprocess(
+    X: np.ndarray,
+    mode: str = "cosine",
+) -> np.ndarray:
+
+    if mode == "cosine":
+        # L2 normalize each embedding vector
+        X_proc = normalize(X, norm="l2", axis=1)
+
+    elif mode == "euclid":
+        # standardize features (dimensions) across samples
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        X_proc = scaler.fit_transform(X)
+
+    else:
+        raise ValueError("mode must be 'cosine' or 'euclid'")
+
+    return X_proc
+
+def ids_kstar_gride_silent(X, mode="cosine"):
+    Xp = _preprocess(X, mode=mode)
+
+    # remove NaNs / infs
+    finite_mask = np.isfinite(Xp).all(axis=1)
+    Xp = Xp[finite_mask]
+
+    # remove exact duplicates
+    Xp = np.unique(Xp, axis=0)
+    if Xp.shape[0] < 10:
+        return np.nan
+
+    d = dp.Data(coordinates=Xp)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = d.return_ids_kstar_gride()
+
+    ids_curve = res[0] if isinstance(res, (list, tuple)) else res
+
+    return float(ids_curve[-1])
+
+def ids_2nn_silent(X, mode="cosine", algorithm="base"):
+    """
+    ID via 2NN estimator (dadapy.compute_id_2NN).
+
+    algorithm:
+      - "base" : standard 2NN estimator
+      - "ml"   : maximum-likelihood variant of 2NN
+    """
+    # same preprocessing as GRIDE
+    Xp = _preprocess(X, mode=mode)
+
+    # remove NaNs / infs
+    finite_mask = np.isfinite(Xp).all(axis=1)
+    Xp = Xp[finite_mask]
+
+    # remove exact duplicates
+    Xp = np.unique(Xp, axis=0)
+    if Xp.shape[0] < 10:
+        return np.nan
+
+    d = dp.Data(coordinates=Xp)
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        id_val, id_err, rs = d.compute_id_2NN(algorithm=algorithm)
+
+    return float(id_val)
+
+def compute_layerwise_ids_kstar(layer_ids, layer_embs):
+    ids_res = {}
+    for ell in layer_ids:
+        X = layer_embs[ell]
+        print(f"    Computing k*-GRIDE for layer {ell} (N={X.shape[0]}, D={X.shape[1]})")
+
+        try:
+            id_val = ids_kstar_gride_silent(X, mode=DISTANCE_MODE)
+            ids_res[ell] = id_val
+            print(f"      ID(layer={ell}) = {id_val:.2f}")
+        except Exception as e:
+            print(f"      [WARNING] ID failed for layer {ell}: {e}")
+            ids_res[ell] = np.nan
+
+    return ids_res
+
+def compute_layerwise_ids_2nn(layer_ids, layer_embs, algorithm="base"):
+    ids_res = {}
+    for ell in layer_ids:
+        X = layer_embs[ell]
+        print(f"    [2NN-{algorithm}] layer {ell} (N={X.shape[0]}, D={X.shape[1]})")
+
+        try:
+            id_val = ids_2nn_silent(X, mode=DISTANCE_MODE, algorithm=algorithm)
+            ids_res[ell] = id_val
+            print(f"      ID_2NN_{algorithm}(layer={ell}) = {id_val:.2f}")
+        except Exception as e:
+            print(f"      [WARNING] 2NN-{algorithm} failed for layer {ell}: {e}")
+            ids_res[ell] = np.nan
+
+    return ids_res
+
+def main_npz_compare_methods():
+    NPZ_PATHS = {
+        "CN": "/gpfs/home/nyang/embs/mbert_embs_cn_new.npz",
+        "EN": "/gpfs/home/nyang/embs/mbert_embs_en.npz",
+        "FR": "/gpfs/home/nyang/embs/mbert_embs_fr.npz",
+    }
+    langs = ["CN", "EN", "FR"]
+    OUT_DIR = os.path.dirname(list(NPZ_PATHS.values())[0])
+    os.makedirs(OUT_DIR, exist_ok=True)
+    # === NEW: color map ===
+    COLORS = {
+        "CN": "#cb6ce6",
+        "EN": "#ff751f",
+        "FR": "#ffde59",
+        "MEAN": "#ff1fa9",
+    }
+
+    # store IDs per method
+    lang2ids_gride = {}
+    lang2ids_2nn   = {}
+    lang2ids_2nnml = {}
+
+    # ========== compute IDs ==========
+    for lang in langs:
+        npz_path = NPZ_PATHS[lang]
+        print(f"\n=== Processing {lang} ===")
+        layer_ids, layer_embs = load_layer_embs_from_npz(
+            npz_path,
+            max_tokens=MAX_TOK_PER_LANG,
+            seed=SEED,
+        )
+
+        # 1) GRIDE
+        ids_gride = compute_layerwise_ids_kstar(layer_ids, layer_embs)
+        lang2ids_gride[lang] = ids_gride
+
+        # 2) 2NN (base)
+        ids_2nn = compute_layerwise_ids_2nn(layer_ids, layer_embs, algorithm="base")
+        lang2ids_2nn[lang] = ids_2nn
+
+        # 3) 2NN (ML)
+        ids_2nn_ml = compute_layerwise_ids_2nn(layer_ids, layer_embs, algorithm="ml")
+        lang2ids_2nnml[lang] = ids_2nn_ml
+
+    # helper: plot comparison for one method
+    def _plot_method_comparison(lang2ids_method, title_suffix):
+        plt.figure(figsize=(8, 5))
+
+        all_layers = set()
+        lang2series = {}
+
+        for lang in langs:
+            ids_res = lang2ids_method[lang]
+
+            # drop NaN layers
+            layers = sorted(k for k, v in ids_res.items() if not np.isnan(v))
+            vals = [ids_res[ell] for ell in layers]
+
+            lang2series[lang] = (layers, vals)
+            all_layers.update(layers)
+
+            # === plot each language ===
+            plt.plot(
+                layers,
+                vals,
+                marker="o",
+                label=lang,
+                color=COLORS[lang],
+                zorder=3
+            )
+
+        # === compute MEAN across languages ===
+        all_layers = sorted(all_layers)
+        mean_vals = []
+
+        for ell in all_layers:
+            vals = []
+            for lang in langs:
+                ids_res = lang2ids_method[lang]
+                if ell in ids_res and not np.isnan(ids_res[ell]):
+                    vals.append(ids_res[ell])
+            mean_vals.append(np.mean(vals) if len(vals) > 0 else np.nan)
+
+        # === plot MEAN  ===
+        plt.plot(
+            all_layers,
+            mean_vals,
+            linestyle="--",
+            linewidth=2.5,
+            color=COLORS["MEAN"],
+            label="Mean",
+            zorder=4
+        )
+
+        # === formatting ===
+        plt.xlabel("Layer")
+        plt.ylabel("Intrinsic Dimension")
+        plt.title(f"mBERT token ID – {title_suffix}")
+
+        # left limit = 0
+        plt.xlim(left=0)
+        # Tick every layer
+        plt.xticks(np.arange(0, 13, 1))  # tick every layer
+
+        # === Light grid: both vertical and horizontal ===
+        plt.grid(
+            True,
+            axis="both",
+            linewidth=0.6,
+            alpha=0.3,
+        )
+
+        plt.legend()
+        plt.tight_layout()
+
+        # ---- Save figure in same folder as NPZ ----
+        clean_suffix = (
+            title_suffix
+            .replace("*", "star")
+            .replace("(", "")
+            .replace(")", "")
+            .replace("-", "_")
+        )
+
+        out_path = os.path.join(
+            OUT_DIR,
+            f"mbert_ID_{clean_suffix}.png"
+        )
+
+        plt.savefig(
+            out_path,
+            dpi=300,
+            bbox_inches="tight"
+        )
+
+        print(f"Saved → {out_path}")
+
+        plt.close()
+    # ========== plots ==========
+    _plot_method_comparison(lang2ids_gride, "(k*-GRIDE)")
+    _plot_method_comparison(lang2ids_2nn, "(2NN-base)")
+    _plot_method_comparison(lang2ids_2nnml, "(2NN-ML)")
+
+    return lang2ids_gride, lang2ids_2nn, lang2ids_2nnml
+
+lang2ids_gride, lang2ids_2nn, lang2ids_2nnml = main_npz_compare_methods()
