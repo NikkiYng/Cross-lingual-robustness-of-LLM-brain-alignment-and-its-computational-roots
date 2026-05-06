@@ -1,0 +1,546 @@
+# 1. Load library
+
+import os
+import torch
+import torch.nn.functional as F
+import pandas as pd
+import numpy as np
+import spacy_alignments as tokenizations
+from tqdm import tqdm
+from transformers import BertTokenizerFast, BertForMaskedLM
+import matplotlib.pyplot as plt
+
+
+# 2. Setups
+
+MODEL_NAME = "bert-base-multilingual-cased"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+LANG_FILES = {
+    "CN": "/gpfs/home/nyang/tr/lppCNtr.csv",
+    "EN": "/gpfs/home/nyang/tr/lppENtr.csv",
+    "FR": "/gpfs/home/nyang/tr/lppFRtr.csv",
+}
+CHUNK_SIZE = 64
+OUT_RUNWISE_MEANS_CSV = "mbert_runwise_layerwise_mean_pll.csv"
+OUT_CORR_CSV = "mbert_runwise_pairwise_corr_by_layer.csv"
+OUT_PNG = "surprisal_convergence_across_layers.png"
+
+tokenizer = BertTokenizerFast.from_pretrained(MODEL_NAME)
+model = BertForMaskedLM.from_pretrained(
+    MODEL_NAME,
+    output_hidden_states=True
+)
+model.eval()
+model.to(DEVICE)
+@torch.no_grad()
+
+# 3. Helpers
+def layerwise_word_pll(words, chunk_size=None):
+
+    sent = " ".join(words)
+
+    enc = tokenizer(
+        sent,
+        add_special_tokens=True,
+        return_tensors="pt"
+    )
+
+    enc = {k: v.to(DEVICE) for k, v in enc.items()}
+
+    input_ids = enc["input_ids"][0]
+    attn = enc["attention_mask"][0]
+
+    wp_tokens = tokenizer.convert_ids_to_tokens(
+        input_ids
+    )[1:-1]
+
+    word2token, _ = tokenizations.get_alignments(
+        words,
+        wp_tokens
+    )
+
+    word2seqpos = [
+        [wp_i + 1 for wp_i in wp_idxs]
+        for wp_idxs in word2token
+    ]
+
+    seq_len = input_ids.size(0)
+
+    if seq_len <= 2:
+        return np.zeros((len(words), 12), dtype=np.float32)
+
+    mask_positions = list(range(1, seq_len - 1))
+
+    mask_id = tokenizer.mask_token_id
+
+    transform = model.cls.predictions.transform
+    decoder = model.cls.predictions.decoder
+    bias = model.cls.predictions.bias
+
+    if chunk_size is None:
+        chunks = [mask_positions]
+    else:
+        chunks = [
+            mask_positions[i:i + chunk_size]
+            for i in range(
+                0,
+                len(mask_positions),
+                chunk_size
+            )
+        ]
+
+    all_surprisal_pos_layer = []
+
+    for pos_chunk in chunks:
+
+        B = len(pos_chunk)
+
+        pos_idx = torch.tensor(
+            pos_chunk,
+            device=DEVICE
+        )
+
+        batch_idx = torch.arange(
+            B,
+            device=DEVICE
+        )
+
+        batch_ids = input_ids.unsqueeze(0).repeat(B, 1)
+        batch_attn = attn.unsqueeze(0).repeat(B, 1)
+
+        true_ids = batch_ids[
+            batch_idx,
+            pos_idx
+        ].clone()
+
+        batch_ids[
+            batch_idx,
+            pos_idx
+        ] = mask_id
+
+        out = model(
+            input_ids=batch_ids,
+            attention_mask=batch_attn,
+            return_dict=True
+        )
+
+        hidden_states = out.hidden_states
+
+        surprisal_pos_layer = torch.empty(
+            (B, 12),
+            device=DEVICE,
+            dtype=torch.float32
+        )
+
+        for layer_i in range(1, 13):
+
+            hs = hidden_states[layer_i]
+
+            hs_t = hs[
+                batch_idx,
+                pos_idx,
+                :
+            ]
+
+            x = transform(hs_t)
+
+            logits = decoder(x) + bias
+
+            log_probs = F.log_softmax(
+                logits,
+                dim=-1
+            )
+
+            surprisal = -log_probs[
+                batch_idx,
+                true_ids
+            ]
+
+            surprisal_pos_layer[
+                :,
+                layer_i - 1
+            ] = surprisal
+
+        all_surprisal_pos_layer.append(
+            surprisal_pos_layer.detach().cpu()
+        )
+
+    surprisal_pos_layer_cpu = torch.cat(
+        all_surprisal_pos_layer,
+        dim=0
+    ).numpy()
+
+    word_pll_layers = np.zeros(
+        (len(words), 12),
+        dtype=np.float32
+    )
+
+    for w_i, seq_positions in enumerate(word2seqpos):
+
+        for pos in seq_positions:
+
+            row = pos - 1
+
+            if 0 <= row < surprisal_pos_layer_cpu.shape[0]:
+
+                word_pll_layers[w_i] += \
+                    surprisal_pos_layer_cpu[row]
+
+    return word_pll_layers
+
+
+def detect_run_col(df):
+
+    for c in df.columns:
+
+        if "run" in c.lower():
+            return c
+
+    raise ValueError("No run column found.")
+
+
+def load_sentence_lists_with_run(csv_path):
+
+    df = pd.read_csv(csv_path)
+
+    run_col = detect_run_col(df)
+
+    sort_col = (
+        "word_offset"
+        if "word_offset" in df.columns
+        else "offset"
+    )
+
+    df = df.sort_values(
+        [run_col, "snt_id", sort_col]
+    ).reset_index(drop=True)
+
+    grouped = (
+        df.groupby([run_col, "snt_id"])["word"]
+        .apply(list)
+        .reset_index()
+    )
+
+    sent_list = list(
+        zip(
+            grouped[run_col],
+            grouped["word"]
+        )
+    )
+
+    return sent_list, run_col, df
+
+
+def mean_curve_per_run(sent_list, chunk_size=64):
+
+    sum_layers = {}
+    n_words = {}
+
+    for run_id, words in tqdm(
+        sent_list,
+        desc="Sentences"
+    ):
+
+        pll_word_layer = layerwise_word_pll(
+            words,
+            chunk_size
+        )
+
+        if pll_word_layer.size == 0:
+            continue
+
+        if run_id not in sum_layers:
+
+            sum_layers[run_id] = np.zeros(12)
+            n_words[run_id] = 0
+
+        sum_layers[run_id] += pll_word_layer.sum(axis=0)
+
+        n_words[run_id] += pll_word_layer.shape[0]
+
+    run_ids_sorted = sorted(sum_layers.keys())
+
+    run_means = np.zeros(
+        (len(run_ids_sorted), 12),
+        dtype=np.float32
+    )
+
+    for i, r in enumerate(run_ids_sorted):
+
+        run_means[i] = \
+            sum_layers[r] / n_words[r]
+
+    return run_ids_sorted, run_means
+
+
+# 3. Main
+
+def main():
+
+    runwise = {}
+
+    for lang, path in LANG_FILES.items():
+
+        print(f"\n=== {lang} ===")
+
+        sent_list, run_col, _ = \
+            load_sentence_lists_with_run(path)
+
+        run_ids, run_means = \
+            mean_curve_per_run(
+                sent_list,
+                CHUNK_SIZE
+            )
+
+        runwise[lang] = {
+            "run_ids": run_ids,
+            "means": run_means
+        }
+
+
+    # Save CSV
+    rows = []
+
+    for lang, d in runwise.items():
+
+        for i, run_id in enumerate(d["run_ids"]):
+
+            for layer in range(12):
+
+                rows.append({
+                    "lang": lang,
+                    "run": run_id,
+                    "layer": layer + 1,
+                    "mean_surprisal":
+                        float(d["means"][i, layer]),
+                })
+
+    pd.DataFrame(rows).to_csv(
+        OUT_RUNWISE_MEANS_CSV,
+        index=False
+    )
+
+
+
+    # Compute mean curves
+
+    layers = np.arange(1, 13)
+
+    colors = {
+        "CN": "#cb6ce6",
+        "EN": "#ff751f",
+        "FR": "#ffde59",
+        "MEAN": "#ff1fa9"
+    }
+
+    lang_mean_curves = {}
+
+    for lang in ["CN", "EN", "FR"]:
+
+        lang_mean_curves[lang] = np.nanmean(
+            runwise[lang]["means"],
+            axis=0
+        )
+
+    mean_curve = np.nanmean(
+        np.vstack(list(lang_mean_curves.values())),
+        axis=0
+    )
+
+    # Plot
+
+    plt.figure(figsize=(6,5))
+
+    for lang in ["CN", "EN", "FR"]:
+
+        plt.plot(
+            layers,
+            lang_mean_curves[lang],
+            marker="o",
+            color=colors[lang],
+            label=lang,
+            zorder=3
+        )
+
+    plt.plot(
+        layers,
+        mean_curve,
+        linestyle=":",
+        linewidth=2.5,
+        color=colors["MEAN"],
+        label="Mean",
+        zorder=4
+    )
+
+    plt.xlabel("Layer")
+    plt.ylabel("Mean Surprisal (nats)")
+    plt.title("Layerwise mBERT PLL Surprisal")
+
+    plt.xlim(left=0)
+
+    plt.xticks(np.arange(1, 13, 1))
+
+    plt.grid(
+        True,
+        linestyle="--",
+        alpha=0.4
+    )
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.savefig(
+        OUT_PNG,
+        dpi=300
+    )
+
+    print(f"Saved plot to: {OUT_PNG}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+CSV_PATH = "mbert_runwise_layerwise_mean_pll.csv"
+OUT_PNG = "layerwise_surprisal_mbert_new.png"
+
+
+# 5. Plot mean surprisal
+
+df = pd.read_csv(CSV_PATH)
+layers = np.arange(1, 13)
+
+colors = {
+    "CN": "#cb6ce6",
+    "EN": "#ff751f",
+    "FR": "#ffde59",
+    "MEAN": "#ff1fa9"
+}
+
+lang_mean_curves = {}
+
+for lang in ["CN", "EN", "FR"]:
+
+    lang_df = df[df["lang"] == lang]
+
+    layer_means = (
+        lang_df
+        .groupby("layer")["mean_surprisal"]
+        .mean()
+        .reindex(layers)
+        .values
+    )
+
+    lang_mean_curves[lang] = layer_means
+
+
+# Mean across languages
+mean_curve = np.nanmean(
+    np.vstack(list(lang_mean_curves.values())),
+    axis=0
+)
+
+plt.figure(figsize=(7, 4.5))
+
+# Language curves
+for lang in ["CN", "EN", "FR"]:
+
+    plt.plot(
+        layers,
+        lang_mean_curves[lang],
+        marker="o",
+        color=colors[lang],
+        label=lang,
+        zorder=3
+    )
+
+# Mean dotted line
+plt.plot(
+    layers,
+    mean_curve,
+    linestyle="--",
+    linewidth=2.5,
+    color=colors["MEAN"],
+    label="Mean",
+    zorder=4
+)
+
+plt.xlabel("Layer")
+plt.ylabel("Mean Surprisal (nats)")
+plt.title("Layerwise mBERT PLL Surprisal")
+plt.xlim(left=0) # Start x-axis at 0
+plt.xticks(np.arange(0, 13, 1))  # tick every layer
+plt.grid(
+    True,
+    which="both",
+    alpha=0.4
+) # Keep grid
+plt.legend()
+plt.tight_layout()
+plt.savefig(
+    OUT_PNG,
+    dpi=300
+)
+
+
+# 6. Plot surprisal convergence
+
+CSV_PATH = "mbert_runwise_pairwise_corr_by_layer.csv"
+OUT_PNG = "surprisal_convergence_across_layers.png"
+
+df = pd.read_csv(CSV_PATH)
+layers = df["layer"].values
+colors = {
+    "r_EN_CN": "#cb6ce6",
+    "r_EN_FR": "#ff751f",
+    "r_CN_FR": "#ffde59",
+    "MEAN": "#ff1fa9"
+}
+plt.figure(figsize=(7, 4.5))
+
+# Pairwise curves
+for col in ["r_EN_CN", "r_EN_FR", "r_CN_FR"]:
+
+    plt.plot(
+        layers,
+        df[col],
+        marker="o",
+        color=colors[col],
+        label=col,
+        zorder=3
+    )
+
+# Mean absolute r (dotted)
+plt.plot(
+    layers,
+    df["abs_mean_r"],
+    linestyle="--",
+    linewidth=2.5,
+    color=colors["MEAN"],
+    label="Mean |r|",
+    zorder=4
+)
+
+plt.xlabel("Layer")
+plt.ylabel("Spearman Correlation (r)")
+plt.title("Cross-lingual Convergence Across Layers")
+plt.xlim(left=0)
+plt.xticks(np.arange(0, 13, 1))
+plt.grid(
+    True,
+    which="both",
+    alpha=0.35
+)
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    OUT_PNG,
+    dpi=300
+)
+
+print(f"Saved plot to: {OUT_PNG}")
