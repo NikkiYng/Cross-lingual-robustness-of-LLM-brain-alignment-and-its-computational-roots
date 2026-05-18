@@ -1,0 +1,83 @@
+import torch
+import pandas as pd
+import numpy as np
+import spacy_alignments as tokenizations
+from tqdm import tqdm
+from transformers import BertTokenizerFast, BertModel
+
+# 1. Load model/tokenizer
+tokenizer = BertTokenizerFast.from_pretrained("bert-base-multilingual-cased")
+model = BertModel.from_pretrained(
+    "bert-base-multilingual-cased",
+    output_hidden_states=True,
+    output_attentions=False, 
+)
+model.eval()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+# 2. Helpers
+def embedding_alignment(word2token, token_level_emb):
+    """Average subword vectors per word. Safe for empty lists."""
+    D = token_level_emb.shape[1]
+    out = np.zeros((len(word2token), D), dtype=np.float32)
+    for i, idxs in enumerate(word2token):
+        if idxs:
+            out[i] = token_level_emb[idxs].mean(axis=0)
+        else:
+            out[i] = 0.0  # or np.nan
+    return out
+
+@torch.no_grad()
+def retrieve_embedding(tokens):
+    sent = " ".join(tokens)
+
+    encoded_input = tokenizer(sent, add_special_tokens=True, return_tensors="pt")
+    encoded_input = {k: v.to(device) for k, v in encoded_input.items()}
+
+    wp_tokens = tokenizer.convert_ids_to_tokens(
+        encoded_input["input_ids"][0].tolist()
+    )[1:-1]
+
+    word2token, token2word = tokenizations.get_alignments(tokens, wp_tokens)
+    output = model(**encoded_input, return_dict=False)
+    hidden_states = output[2]        # tuple: [embeddings, layer1..12]
+    layers = hidden_states[1:]       # 12 layers
+
+    # per-layer alignment to words
+    out = {}
+    for i, layer in enumerate(layers, start=1):
+        X = layer.squeeze(0)[1:-1].detach().cpu().to(torch.float32).numpy()  # (n_wp, 768)
+        out[f"BERT_embed_{i}_isol"] = embedding_alignment(word2token, X)      # (n_words, 768)
+    return out
+
+def get_all_embeddings(utt):
+    rows = []
+    for tokens in tqdm(utt, total=len(utt)):
+        embs = retrieve_embedding(tokens)
+        n = len(tokens)
+        for i in range(n):
+            rows.append({k: np.array(v[i]) for k, v in embs.items()})
+    return pd.DataFrame(rows)
+
+# 3. Data
+df = pd.read_csv("/gpfs/home/nyang/tr/lppENtr.csv", encoding="utf-8-sig")
+df = df.sort_values(["snt_id"]).reset_index(drop=True)
+utt = df.groupby("snt_id")["word"].apply(list).tolist()
+embeddings_df = get_all_embeddings(utt)
+assert len(embeddings_df) == len(df), f"Mismatch: {len(embeddings_df)} vs {len(df)}"
+
+# 4. Save NPZ
+result = pd.concat([df.reset_index(drop=True), embeddings_df.reset_index(drop=True)], axis=1)
+
+npz_data = {
+    "word": result["word"].values,
+    "offset": result["offset"].values,
+    "run_id": result["run_id"].values,
+}
+
+for i in range(1, 13):
+    mat = np.stack(result[f"BERT_embed_{i}_isol"].to_numpy(), axis=0).astype(np.float32)
+    npz_data[f"BERT_layer_{i}isol"] = mat
+
+np.savez_compressed("./embs/mbert_embs_en2.npz", **npz_data)
