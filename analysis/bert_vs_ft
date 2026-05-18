@@ -1,0 +1,232 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import ttest_rel
+from PIL import Image
+from statsmodels.stats.multitest import fdrcorrection
+import statsmodels.formula.api as smf
+
+
+# 1. Paths
+
+bert_path = "./416/fr_mbert/group_cv/group_cv_layer_12.npy"
+ft_path   = "./416/ft/group_cv_ft_isol_fr.npy"
+out_dir = "./ft/bert_vs_ft_perm_layer5_maps"
+os.makedirs(out_dir, exist_ok=True)
+
+
+# 2. Helper
+
+def signflip_perm_test_streaming(diff, n_perm=10000, seed=42):
+    """
+    Two-sided sign-flip permutation test for within-subject differences.
+    Returns:
+      obs: mean(diff) per ROI, shape (n_roi,)
+      p: two-sided p-values per ROI, shape (n_roi,)
+    """
+    rng = np.random.default_rng(seed)
+    n_sub, n_roi = diff.shape
+
+    obs = diff.mean(axis=0)  # (n_roi,)
+
+    # Count how many permuted |mean| >= |obs|
+    extreme = np.zeros(n_roi, dtype=np.int32)
+
+    # Precompute abs(obs) once
+    abs_obs = np.abs(obs)
+
+    for _ in range(n_perm):
+        signs = rng.choice([-1, 1], size=(n_sub, 1))
+        perm_mean = (diff * signs).mean(axis=0)
+        extreme += (np.abs(perm_mean) >= abs_obs)
+
+    # add +1 smoothing to avoid 0 p-values
+    p = (extreme + 1) / (n_perm + 1)
+    return obs, p
+
+def signflip_global(delta_subj, n_perm=10000, seed=42, alternative="greater"):
+    """
+    Sign-flip permutation on subject-level paired differences.
+    delta_subj: shape (n_subjects,) where delta = BERT - FT
+    alternative: "greater" (BERT>FT), "less", or "two-sided"
+    """
+    rng = np.random.default_rng(seed)
+    n = delta_subj.shape[0]
+
+    obs = delta_subj.mean()
+    extreme = 0
+
+    for _ in range(n_perm):
+        signs = rng.choice([-1, 1], size=n)
+        perm_mean = (delta_subj * signs).mean()
+
+        if alternative == "greater":
+            extreme += (perm_mean >= obs)
+        elif alternative == "less":
+            extreme += (perm_mean <= obs)
+        elif alternative == "two-sided":
+            extreme += (abs(perm_mean) >= abs(obs))
+        else:
+            raise ValueError("alternative must be 'greater', 'less', or 'two-sided'")
+
+    p = (extreme + 1) / (n_perm + 1)  # +1 smoothing
+    return obs, p
+
+def cohen_d_paired(delta_subj):
+    # Cohen's dz for paired designs
+    return delta_subj.mean() / delta_subj.std(ddof=1)
+
+def global_compare(bert_path, ft_path, n_perm=10000, seed=42):
+    bert = np.load(bert_path)  # (subjects, 416)
+    ft   = np.load(ft_path)
+
+    if bert.ndim != 2 or ft.ndim != 2 or bert.shape != ft.shape:
+        raise ValueError(f"Bad shapes: bert {bert.shape}, ft {ft.shape}")
+    if bert.shape[1] != 416:
+        raise ValueError(f"Expected 416 ROIs, got {bert.shape[1]}")
+
+    # Subject-level global score = mean across ROIs
+    bert_subj = bert.mean(axis=1)   # (subjects,)
+    ft_subj   = ft.mean(axis=1)     # (subjects,)
+
+    # Global paired difference per subject (BERT - FT)
+    delta_subj = bert_subj - ft_subj
+    
+    # Permutation (one-sided: BERT > FT)
+    obs_mean_delta, p_perm = signflip_global(delta_subj, n_perm=n_perm, seed=seed, alternative="greater")
+    
+    # Optional: paired t-test (one-sided)
+    t_stat, p_two = ttest_rel(bert_subj, ft_subj)
+    p_t_one = p_two / 2 if t_stat > 0 else 1 - (p_two / 2)
+
+    d = cohen_d_paired(delta_subj)
+
+    return {
+        "n_subjects": bert.shape[0],
+        "mean_FT": ft_subj.mean(),
+        "mean_BERT": bert_subj.mean(),
+        "mean_delta_FT_minus_BERT": obs_mean_delta,
+        "perm_p_one_sided": p_perm,
+        "t_stat": t_stat,
+        "t_p_one_sided": p_t_one,
+        "cohen_dz": d,
+    }
+
+def fit_pooled_lmm(bert, ft, lang_name="FR"):
+    """
+    bert, ft: arrays (n_subjects, n_rois)
+    Fits: score ~ model + (1|subject) + (1|roi)
+    using statsmodels MixedLM with ROI as variance component.
+    """
+    n_sub, n_roi = bert.shape
+
+    # Long-form dataframe: two rows per (subject, roi) => FT and BERT
+    df = pd.DataFrame({
+        "subject": np.repeat(np.arange(n_sub), n_roi * 2),
+        "roi": np.tile(np.repeat(np.arange(n_roi), 2), n_sub),
+        "model": np.tile([0, 1], n_sub * n_roi),  # 0=FT, 1=BERT
+        "score": np.empty(n_sub * n_roi * 2, dtype=float)
+    })
+
+    # Fill scores in the same order (FT then BERT per subject×roi)
+    # df order is (sub, roi, model=0 then 1)
+    ft_flat = ft.reshape(-1)
+    bert_flat = bert.reshape(-1)
+    df.loc[df["model"] == 0, "score"] = np.repeat(ft_flat, 1)
+    df.loc[df["model"] == 1, "score"] = np.repeat(bert_flat, 1)
+
+    # Mixed model:
+    # - groups="subject" gives random intercept for subject
+    # - vc_formula adds ROI random intercepts
+    md = smf.mixedlm(
+        "score ~ model",
+        df,
+        groups=df["subject"],
+        vc_formula={"roi": "0 + C(roi)"}
+    )
+    res = md.fit(reml=True, method="lbfgs")
+
+    beta1 = res.params["model"]
+    se1 = res.bse["model"]
+    z1 = beta1 / se1
+    p1 = res.pvalues["model"]
+
+    out = {
+        "lang": lang_name,
+        "n_subjects": n_sub,
+        "n_rois": n_roi,
+        "beta_model_BERT_minus_FT": beta1,
+        "se": se1,
+        "z": z1,
+        "p": p1,
+        "converged": res.converged
+    }
+    return out, res
+
+
+
+# 3. Load brain scores
+bert = np.load(bert_path)
+ft   = np.load(ft_path)
+
+print("BERT shape:", bert.shape)
+print("FT shape:", ft.shape)
+
+# 4. Permutation test
+diff = bert - ft  # (subjects, 416)
+obs_diff, p_perm = signflip_perm_test_streaming(diff, n_perm=10000, seed=42)
+reject, p_fdr = fdrcorrection(p_perm, alpha=0.05)
+
+bert_better = reject & (obs_diff > 0)
+ft_better   = reject & (obs_diff < 0)
+
+print("Significant (FDR):", int(reject.sum()))
+print("BERT > FT:", int(bert_better.sum()))
+print("FT > BERT:", int(ft_better.sum()))
+
+np.save(os.path.join(out_dir, "obs_diff.npy"), obs_diff)
+np.save(os.path.join(out_dir, "p_perm.npy"), p_perm)
+np.save(os.path.join(out_dir, "p_fdr.npy"), p_fdr)
+
+
+
+# 4. Global (subject-level) tests
+
+langs = {
+    "EN": {
+        "bert": "./416/en_mbert/group_cv/group_cv_layer_12.npy",
+        "ft":   ".416/ft/group_cv_ft_isol_en.npy",
+    },
+    "FR": {
+        "bert": "./416/fr_mbert/group_cv/group_cv_layer_12.npy",
+        "ft":   "./416/ft/group_cv_ft_isol_fr.npy",
+    },
+    "CN": {
+        "bert": "./416/cn_mbert/group_cv/group_cv_layer_12.npy",
+        "ft":   "./416/ft/group_cv_ft_isol_cn.npy",
+    },
+}
+
+for L, paths in langs.items():
+    res = global_compare(paths["bert"], paths["ft"], n_perm=10000, seed=42)
+    print(f"\n{L} (N={res['n_subjects']}):")
+    print(f"  mean(FT)   = {res['mean_FT']:.6f}")
+    print(f"  mean(BERT) = {res['mean_BERT']:.6f}")
+    print(f"  mean Δ (BERT-FT) = {res['mean_delta_FT_minus_BERT']:.6f}")
+    print(f"  Perm p (one-sided, BERT>FT) = {res['perm_p_one_sided']:.6g}")
+    print(f"  t = {res['t_stat']:.3f}, t-test p(one-sided) = {res['t_p_one_sided']:.6g}")
+    print(f"  Cohen's dz = {res['cohen_dz']:.3f}")
+
+# 5. Mixed model testing
+
+rows = []
+for L, paths in langs.items():
+    bert = np.load(paths["bert"])
+    ft = np.load(paths["ft"])
+    out_row, _ = fit_pooled_lmm(bert, ft, lang_name=L)
+    rows.append(out_row)
+
+df_sup = pd.DataFrame(rows)
+df_sup.to_csv(os.path.join(out_dir, "sup_lmm_pooled_bert_vs_ft.csv"), index=False)
+print(df_sup)
