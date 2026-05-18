@@ -1,0 +1,249 @@
+#1. Load libraries
+
+import os
+import numpy as np
+np.random.seed(42)
+import pandas as pd
+import re
+from tqdm import tqdm
+from tqdm import trange
+
+from fmri_encoder.loaders import get_groups    
+from fmri_encoder.features import FMRIPipe, FeaturesPipe 
+from fmri_encoder.encoder import Encoder
+
+from scipy import stats
+from scipy.io import loadmat
+from sklearn.model_selection import LeavePOut
+from nilearn import datasets
+import argparse
+
+import warnings
+warnings.filterwarnings("ignore")
+
+
+# 2. Setups
+
+ts_dir = './Derivatives/LppEN_SchTian_416/'
+SubList = [f for f in sorted(os.listdir(ts_dir)) if f.startswith('sub-')]
+NumSub = len(SubList)
+
+n_rois = 416  # 400 parcels  
+yeo_net = 7     # 7 networks
+res = 2         # 2mm resolution
+
+# Fmri encoder 
+# Parameters for alignment
+tr = 2                  # repetition time
+# Using the standard haemodynamic function
+encoding_method = 'hrf'      # haemodynamic response function
+# Set parameters
+fmri_ndim = None             # number of dimensions for fMRI data
+features_ndim = None         # number of dimensions for features
+features_reduction_method = None    
+fmri_reduction_method = None  
+
+features_pipe = FeaturesPipe(
+        features_reduction_method=features_reduction_method, 
+        features_ndim=features_ndim
+        )         
+fmri_pipe = FMRIPipe(
+    fmri_reduction_method=fmri_reduction_method,
+    fmri_ndim=fmri_ndim
+    )
+
+# Regression parameters
+out_per_fold = 1 # leave one out
+linearmodel = 'ridgecv'
+encoding_params = {
+    "alpha": 0.001,
+    "alpha_per_target": True,
+} 
+
+
+
+
+# 3. Functions
+
+def fisher_transform(r):
+    """ Fisher transformation to correlation coefficient."""
+    return 0.5 * np.log((1 + r) / (1 - r))
+
+def p_adjust_bh(p):
+    """Benjamini-Hochberg p-value correction for multiple hypothesis testing."""
+    p = np.asfarray(p)
+    by_descend = p.argsort()[::-1]
+    by_orig = by_descend.argsort()
+    steps = float(len(p)) / np.arange(len(p), 0, -1)
+    q = np.minimum(1, np.minimum.accumulate(steps * p[by_descend]))
+    return q[by_orig]
+
+def load_time_series_from_rois(time_series):
+    """Load the time series data from the 'ts' key."""
+    if 'ts' in time_series:
+        ts = time_series['ts']
+        print(f"Time series shape from 'ts': {ts.shape}")
+        return ts
+    else:
+        raise KeyError("'ts' key not found in the .mat file.")
+
+def cross_val(var, save_file_path_cv=None, save_file_path_thred=None):
+    rigid_cv_dicts = {}
+
+    # 1. Iterate over each subject folder
+    for sub in tqdm(SubList, desc="Processing Subjects"):
+        subject_dir = f'{ts_dir}{sub}/'
+
+        # Get the list of fMRI run files for this subject and sort by run number
+        all_runs = [f for f in os.listdir(subject_dir) if '_Schaefer400_TianS1_denoised' in f]
+        if not all_runs:
+            print(f"No valid runs found for {sub}, skipping this subject.")
+            continue
+
+        # Sort runs by the original run number from the filenames
+        all_runs_sorted = sorted(all_runs, key=lambda x: int(re.search(r'run-(\d+)', x).group(1)))
+        run_file_map = {i + 1: run_file for i, run_file in enumerate(all_runs_sorted)}
+        
+        # Create a mapping from fMRI run_ids to sequential numbers (1-9) based on their order
+        run_id_mapping = {original_run_id: i + 1 for i, original_run_id in enumerate(sorted(run_file_map.keys()))}
+
+        # Collect embeddings and fMRI data for each run for the subject
+        X = []  # Holds all aligned embeddings across runs
+        Y = []  # Holds all fMRI time series across runs
+        
+        for i, (fmri_run_id, run_file) in enumerate(run_file_map.items(), start=1):
+            # Map the original fMRI `run_id` to a sequential `run_id` for embeddings
+            embedding_run_id = run_id_mapping[fmri_run_id]
+            print(f'Subject: {sub}, Re-mapped Run: {embedding_run_id}, Original fMRI Run ID: {fmri_run_id}, File: {run_file}')
+
+            file_path = f'{subject_dir}{run_file}'
+            if not os.path.exists(file_path):
+                print(f"File {file_path} not found, skipping...")
+                continue
+
+            # Load the fMRI time series for this run
+            time_series = loadmat(file_path)
+            ts = load_time_series_from_rois(time_series)
+          
+            if ts.size == 0:
+                print(f"Warning: Time series data for {sub}, run {fmri_run_id} is empty. Skipping...")
+                continue
+
+            # Preprocess the fMRI data
+            df_run = df[df['run_id'] == embedding_run_id]  # Filter embeddings for this run
+            discard_start = int(np.floor(df_run['offset'].tolist()[0] / tr))
+            ts = ts[discard_start:, :]                
+            ts = fmri_pipe.fit_transform(ts) 
+            nscans = [ts.shape[0]]
+            print(f"Preprocessed fMRI time series shape for {sub}, run {fmri_run_id}: {ts.shape}")
+            
+            # Load and preprocess embeddings for the remapped `embedding_run_id`
+            gentles = df_run['offset'].values.tolist()  # Get offsets specific to this run
+            print(f"gentles shape for {sub}, run {embedding_run_id}: {len(gentles)}")
+            gentles = [[gentle - tr * int(np.floor(df_run['offset'].tolist()[0] / tr)) for gentle in gentles]]
+
+            # Extract embeddings for the current run
+            embeddings = np.array(df_run[var].tolist())
+            print(f"Embeddings shape for {sub}, run {embedding_run_id}: {embeddings.shape}")
+            
+            # Align embeddings with fMRI time points
+            aligned_embeddings = features_pipe.fit_transform(
+                np.vstack(embeddings),
+                encoding_method=encoding_method,
+                tr=tr,
+                groups=get_groups(gentles),
+                gentles=gentles,
+                nscans=nscans
+            )
+            print(f"Aligned-embs {sub}, run {embedding_run_id}: {aligned_embeddings.shape}")
+              
+            # Append aligned data for cross-validation later
+            X.append(aligned_embeddings)
+            Y.append(ts)
+
+        # Perform cross-validation across all runs for the subject
+        logo = LeavePOut(1)
+        scores = []
+
+        for train, test in logo.split(range(num_runs)):  # Split across run indices
+            encoder = Encoder(linearmodel=linearmodel, saving_folder=None, **encoding_params)
+            
+            # Stack training and test data across the specified runs
+            y_train = np.vstack([Y[i] for i in train])
+            X_train = np.vstack([X[i] for i in train])
+            y_test = np.vstack([Y[i] for i in test])
+            X_test = np.vstack([X[i] for i in test])
+            print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+
+            # Fit and evaluate the model
+            encoder.fit(X_train, y_train)
+            test_predictions = encoder.predict(X_test)
+            score = encoder.eval(test_predictions, y_test, axis=0)
+            scores.append(score)
+
+        # Compute mean score for this subject
+        scores_mean = np.mean(scores, axis=0)
+        if len(scores_mean.shape) == 1:
+            scores_mean = scores_mean.reshape(1, -1)
+        rigid_cv_dicts[f'{sub}'] = scores_mean
+
+    # 2. Combine all cross-validation results into a single array
+    group_cv = np.vstack(list(rigid_cv_dicts.values()))
+
+    if save_file_path_cv is not None:
+        np.save(save_file_path_cv, group_cv)
+        print(f'group_cv saved as {save_file_path_cv}.npy')
+
+    # 3. Perform T-tests and FDR correction
+    p_values = []
+    for i in trange(n_rois, desc="Performing T-tests for each ROI"):
+        t_stat, p_value = stats.ttest_1samp(group_cv[:, i], 0, alternative='greater')
+        p_values.append(p_value)
+    qs = p_adjust_bh(p_values)
+    rs = np.mean(group_cv, axis=0)
+    thred_rs = np.where(qs < 0.05, rs, np.nan)
+    if save_file_path_thred is not None:
+        np.save(save_file_path_thred, thred_rs)
+        print(f'thred_rs saved as {save_file_path_thred}.npy')
+        
+    return group_cv, thred_rs
+
+
+
+# 4. Run
+ap = argparse.ArgumentParser()
+ap.add_argument("--npz", required=True, help="Path to mBERT .npz file")
+ap.add_argument("--layer", type=int, required=True, help="Layer index (1–12)")
+ap.add_argument("--cv-out", required=True, help="Output .npy path for group_cv")
+ap.add_argument("--thresh-out", required=True, help="Output .npy path for thred_rs")
+args = ap.parse_args()
+
+# Load NPZ and prepare DataFrame 
+data = np.load(args.npz, allow_pickle=True)
+offset = data["offset"]
+run_id = data["run_id"]
+
+df = pd.DataFrame({
+    "offset": offset,
+    "run_id": run_id,
+})
+
+layer_key = f"BERT_layer_{args.layer}isol"
+if layer_key not in data:
+    raise KeyError(f"{layer_key} not found in NPZ. Available keys: "
+                   f"{[k for k in data.keys() if 'BERT_layer_' in k]}")
+
+df[layer_key] = [row for row in data[layer_key]]
+
+# Run cross-validation 
+group_cv, thred_rs = cross_val(
+    layer_key,
+    save_file_path_cv=args.cv_out.replace(".npy", ""),
+    save_file_path_thred=args.thresh_out.replace(".npy", "")
+)
+
+# Save 
+np.save(args.cv_out, group_cv)
+np.save(args.thresh_out, thred_rs)
+
+print(f"[Done] Layer {args.layer}: saved {args.cv_out} and {args.thresh_out}")
