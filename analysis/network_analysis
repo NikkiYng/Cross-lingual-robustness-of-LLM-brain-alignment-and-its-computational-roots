@@ -1,0 +1,324 @@
+import os
+import glob
+import re
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from nilearn import datasets
+
+
+# 1. Each network as a plot
+
+def get_schaefer400_network_labels():
+    """
+    Returns a list of length 400, where each entry is the Yeo-7 network name
+    (e.g. 'Vis', 'SomMot', 'DorsAttn', 'SalVentAttn', 'Limbic', 'Cont', 'Default')
+    for that ROI index (1..400).
+    """
+    atlas = datasets.fetch_atlas_schaefer_2018(
+        n_rois=400,
+        yeo_networks=7,
+        resolution_mm=2
+    )
+    labels = atlas.labels
+
+    # Drop the first one: "Background"
+    labels = atlas.labels[1:] 
+    
+    network_list = []
+    possible_networks = [
+        "Vis", "SomMot", "DorsAttn",
+        "SalVentAttn", "Limbic", "Cont", "Default"
+    ]
+
+    for lab in labels:
+        if isinstance(lab, bytes):
+            lab = lab.decode("utf-8")
+        lab = str(lab)
+
+        parts = lab.split("_")
+        net = None
+        for p in parts:
+            if p in possible_networks:
+                net = p
+                break
+        if net is None:
+            raise ValueError(f"Could not find network name in label: {lab}")
+        network_list.append(net)
+
+    if len(network_list) != 400:
+        raise ValueError(f"Expected 400 labels, got {len(network_list)}")
+
+    return network_list
+
+def aggregate_scores_by_network(score_vec,
+                                networks_400,
+                                n_cortical=400,
+                                n_subcort=16):
+    """
+    Parameters
+    ----------
+    score_vec : np.ndarray, shape (416,)
+        First 400 = Schaefer-400 (cortical),
+        last 16 = Tian subcortical.
+    networks_400 : list of str, length 400
+        Yeo network name for each Schaefer ROI.
+
+    Returns
+    -------
+    mean_scores : dict
+        Keys: 7 Yeo networks + 'Subcortical'
+        Values: mean score for that network.
+    """
+    score_vec = np.asarray(score_vec)
+    if score_vec.shape[0] < n_cortical + n_subcort:
+        raise ValueError(
+            f"score_vec has length {score_vec.shape[0]}, "
+            f"expected at least {n_cortical + n_subcort}"
+        )
+
+    cortical_scores = score_vec[:n_cortical]
+    subcort_scores = score_vec[n_cortical:n_cortical + n_subcort]
+
+    # Collect scores for each network
+    net_scores = defaultdict(list)
+    for i, net in enumerate(networks_400):
+        net_scores[net].append(cortical_scores[i])
+
+    # Average over ROIs in each network (LH + RH pooled)
+    mean_scores = {
+        net: float(np.mean(vals)) for net, vals in net_scores.items()
+    }
+
+    # Average over the 16 Tian subcortical ROIs
+    mean_scores["Subcortical"] = float(np.mean(subcort_scores))
+
+    return mean_scores
+
+def load_language_means(lang_name, lang_folder, networks_400):
+    """
+    lang_name : str, e.g. 'CN'
+    lang_folder : folder containing group_cv_layer_*.npy
+    networks_400 : list of Yeo-7 network labels for Schaefer-400
+
+    Returns
+    -------
+    df : DataFrame
+        index = layer number (int)
+        columns = 7 networks + 'Subcortical'
+    """
+    pattern = os.path.join(lang_folder, "group_cv_layer_*.npy")
+    files = sorted(glob.glob(pattern))
+
+    rows = []
+    layers = []
+
+    for f in files:
+        m = re.search(r"layer_(\d+)", os.path.basename(f))
+        if not m:
+            continue
+        layer_num = int(m.group(1))
+
+        scores = np.load(f)  # shape (34, 416) or (416,)
+        
+        # If it's (n_subj, 416), average over subjects
+        if scores.ndim == 2:
+            # axis=0 → mean across 34 subjects, result shape (416,)
+            scores_mean = scores.mean(axis=0)
+        else:
+            scores_mean = scores  # already (416,)
+
+        mean_scores = aggregate_scores_by_network(scores_mean, networks_400)
+
+        layers.append(layer_num)
+        rows.append(mean_scores)
+
+    if not rows:
+        raise RuntimeError(f"No matching npy files found in {lang_folder}")
+
+    df = pd.DataFrame(rows, index=layers)
+    df.index.name = "layer"
+    df = df.sort_index()
+    return df
+
+if __name__ == "__main__":
+    base_dir = "./416"
+
+    lang_dirs = {
+        "CN": os.path.join(base_dir, "cn_mbert", "group_cv"),
+        "EN": os.path.join(base_dir, "en_mbert", "group_cv"),
+        "FR": os.path.join(base_dir, "fr_mbert", "group_cv"),
+    }
+
+    # 1) Get network labels
+    networks_400 = get_schaefer400_network_labels()
+
+    # 2) Load per-layer network means for each language
+    df_cn = load_language_means("CN", lang_dirs["CN"], networks_400)
+    df_en = load_language_means("EN", lang_dirs["EN"], networks_400)
+    df_fr = load_language_means("FR", lang_dirs["FR"], networks_400)
+
+    # 3) Align layers (just in case something is missing)
+    common_layers = sorted(
+        set(df_cn.index) & set(df_en.index) & set(df_fr.index)
+    )
+    df_cn = df_cn.loc[common_layers]
+    df_en = df_en.loc[common_layers]
+    df_fr = df_fr.loc[common_layers]
+
+    lang_to_df = {"CN": df_cn, "EN": df_en, "FR": df_fr}
+
+    network_order = [
+        "Vis", "SomMot", "DorsAttn",
+        "SalVentAttn", "Limbic", "Cont", "Default", "Subcortical"
+    ]
+
+    # 4) Output folder for plots
+    out_dir = os.path.join(base_dir, "network_plots")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 5) Plot one figure per network (8 total)
+    for net in network_order:
+        plt.figure(figsize=(6, 4))
+
+        for lang, df in lang_to_df.items():
+            plt.plot(
+                common_layers,
+                df[net].values,
+                marker="o",
+                label=lang,
+            )
+
+        plt.xlabel("Layer")
+        plt.ylabel(f"Mean score ({net})")
+        plt.title(f"{net} network – mean scores per layer")
+        plt.xlim(left=0)
+        plt.legend(title="Language")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        out_path = os.path.join(out_dir, f"{net}_mean_scores_per_layer.png")
+        plt.savefig(out_path, dpi=600)
+        plt.close()
+
+    print(f"Saved network plots to: {out_dir}")
+    
+network_order = [
+    "Vis", "SomMot", "DorsAttn", "SalVentAttn",
+    "Limbic", "Cont", "Default", "Subcortical"
+]
+
+lang_to_df = {"CN": df_cn, "EN": df_en, "FR": df_fr}
+
+# Create 2 rows × 4 columns of subplots
+fig, axes = plt.subplots(2, 4, figsize=(20, 10), sharex=True)
+axes = axes.ravel()  # flatten to 1D array for easy indexing
+
+for i, net in enumerate(network_order):
+    ax = axes[i]
+
+    for lang, df in lang_to_df.items():
+        ax.plot(
+            common_layers,
+            df[net].values,
+            marker="o",
+            label=lang,
+            alpha=0.8
+        )
+    
+    ax.set_title(net, fontsize=14)
+
+    row = i // 4
+    col = i % 4
+
+    # ---- X axis ----
+    ax.set_xlim(left=0)
+    ax.set_xticks(range(0, 13))
+    
+    if row == 0:
+        ax.tick_params(axis='x', labelbottom=True)
+    
+    if row == 1:
+        ax.set_xlabel("Layer")
+    else:
+        ax.set_xlabel("")
+
+    # ---- Y axis ----
+    if col == 0:
+        ax.set_ylabel("Mean score")
+    else:
+        ax.set_ylabel("")
+
+    ax.set_xlim(left=0)
+    ax.set_xticks(range(0, 13))
+    ax.grid(True, which='both', axis='both', alpha=0.3)
+
+fig.legend(lang_to_df.keys(), loc="upper center", ncol=3, fontsize=14)
+plt.tight_layout(rect=[0, 0, 1, 0.95])  # Leave room for legend
+out_path = os.path.join(out_dir, "allnet_mean_scores_per_layer.png")
+fig.savefig(out_path, dpi=600)
+
+
+# 2. Each layer as a plot
+
+# Order of networks on x-axis
+network_order = [
+    "Vis", "SomMot", "DorsAttn", "SalVentAttn",
+    "Limbic", "Cont", "Default", "Subcortical"
+]
+
+lang_to_df = {"CN": df_cn, "EN": df_en, "FR": df_fr}
+layers_to_plot = sorted(common_layers)[:12]
+x = np.arange(len(network_order)) # x positions for the 8 networks
+
+# Create 3 rows × 4 columns of subplots
+fig, axes = plt.subplots(3, 4, figsize=(22, 12), sharey=True)
+axes = axes.ravel()  # flatten to 1D for easy indexing
+
+for idx, layer in enumerate(layers_to_plot):
+    ax = axes[idx]
+
+    for lang, df in lang_to_df.items():
+        y = df.loc[layer, network_order].values
+        ax.plot(
+            x,
+            y,
+            marker="o",
+            label=lang,
+            alpha=0.9
+        )
+
+    ax.set_title(f"Layer {layer}", fontsize=14)
+
+    row = idx // 4
+    col = idx % 4
+
+    # ---- X axis: keep ticks everywhere, labels only on bottom row ----
+    ax.set_xticks(x)
+    if row == 2:
+        ax.set_xticklabels(network_order, rotation=45, ha="right")
+    else:
+        ax.set_xticklabels([])   
+
+    # ---- Y axis: keep ticks everywhere, label only on first column ----
+    if col == 0:
+        ax.set_ylabel("Mean score")
+    else:
+        ax.set_ylabel("")
+
+    ax.grid(True, alpha=0.3)
+
+fig.legend(lang_to_df.keys(), loc="upper center", ncol=3, fontsize=14) # One legend for the whole figure
+plt.subplots_adjust(
+    top=0.90,      
+    bottom=0.09,
+    hspace=0.8,    
+    wspace=0.25     
+)
+
+# Save figure
+out_path = "./layer_by_network_3x4.png"
+fig.savefig(out_path, dpi=300)
+print(f"Saved figure to: {out_path}")
